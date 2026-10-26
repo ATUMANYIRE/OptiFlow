@@ -1,18 +1,41 @@
 import GLPK, { type GLPK as GLPKInstance, type LP } from 'glpk.js'
-import type { AllocationResult, Assignment, Task, Worker, Workload } from '../types.js'
+import type { AllocationResult, Assignment, ConstraintViolationDetail, Task, Worker, Workload } from '../types.js'
 
 interface Candidate { name: string; task: Task; worker: Worker; start: number; end: number }
 type Term = { name: string; coef: number }
 
 let solverPromise: Promise<GLPKInstance> | undefined
+
+/**
+ * Pre-warms and caches the GLPK WebAssembly engine as a singleton.
+ * Runs a trivial LP solve during initialization to trigger JIT compilation and
+ * WebAssembly linear memory allocation, completely eliminating cold-boot overhead.
+ */
 export function prewarmMilp(): Promise<void> {
   if (!solverPromise) {
-    solverPromise = Promise.resolve((GLPK as unknown as () => GLPKInstance)()).catch(error => {
+    solverPromise = Promise.resolve((GLPK as unknown as () => GLPKInstance)()).then(async glpk => {
+      try {
+        await glpk.solve({
+          name: 'optiflow_prewarm',
+          objective: { direction: glpk.GLP_MIN, name: 'obj', vars: [{ name: 'x', coef: 1 }] },
+          subjectTo: [{ name: 'c1', vars: [{ name: 'x', coef: 1 }], bnds: { type: glpk.GLP_LO, lb: 0, ub: 1 } }],
+          bounds: [{ name: 'x', type: glpk.GLP_LO, lb: 0, ub: 1 }],
+        }, { msglev: glpk.GLP_MSG_OFF })
+      } catch {
+        // Prewarm LP solve is non-critical for basic fallback
+      }
+      return glpk
+    }).catch(error => {
       solverPromise = undefined
       throw error
     })
   }
   return solverPromise.then(() => undefined)
+}
+
+// Automatically trigger singleton pre-warming in client-side environment
+if (typeof window !== 'undefined') {
+  void prewarmMilp()
 }
 
 const solver = async (): Promise<GLPKInstance> => {
@@ -42,31 +65,101 @@ export function canPlace(task: Task, worker: Worker, start: number, assigned: As
   return workerAssignments.every(item => end + workload.restSlots <= item.startSlot || start >= item.endSlot + workload.restSlots)
 }
 
-export function countViolations(workload: Workload, assignments: Assignment[]): number {
-  let violations = 0
+/**
+ * Rigorous constraint auditing engine.
+ * Inspects all operational constraints: skills, capacities, shift task counts,
+ * break windows, rest intervals, and release/deadline bounds.
+ */
+export function auditViolations(workload: Workload, assignments: Assignment[]): { violations: number; details: ConstraintViolationDetail[] } {
+  const details: ConstraintViolationDetail[] = []
   const taskIds = new Set<string>()
+
   for (const item of assignments) {
     const task = workload.tasks.find(t => t.id === item.taskId)
     const worker = workload.workers.find(w => w.id === item.workerId)
-    if (!task || !worker || taskIds.has(item.taskId)) { violations++; continue }
+    if (!task) {
+      details.push({ type: 'deadline', message: `Unknown task ${item.taskId}`, taskId: item.taskId, workerId: item.workerId })
+      continue
+    }
+    if (!worker) {
+      details.push({ type: 'skill', message: `Unknown worker ${item.workerId}`, taskId: item.taskId, workerId: item.workerId })
+      continue
+    }
+    if (taskIds.has(item.taskId)) {
+      details.push({ type: 'duplicate', message: `Task ${task.id} assigned multiple times`, taskId: task.id, workerId: worker.id })
+    }
     taskIds.add(item.taskId)
-    if (item.startSlot < task.releaseSlot || item.endSlot !== item.startSlot + task.durationSlots || item.endSlot > task.deadlineSlot || !worker.skills.includes(task.skill) || worker.unavailable.some(window => item.startSlot < window.end && item.endSlot > window.start)) violations++
+
+    if (item.startSlot < task.releaseSlot) {
+      details.push({ type: 'deadline', message: `Task ${task.id} starts at slot ${item.startSlot} before release slot ${task.releaseSlot}`, taskId: task.id, workerId: worker.id })
+    }
+    if (item.endSlot !== item.startSlot + task.durationSlots) {
+      details.push({ type: 'deadline', message: `Task ${task.id} duration mismatch (${item.endSlot - item.startSlot} slots vs ${task.durationSlots} required)`, taskId: task.id, workerId: worker.id })
+    }
+    if (item.endSlot > task.deadlineSlot) {
+      details.push({ type: 'deadline', message: `Task ${task.id} completes at slot ${item.endSlot} after deadline slot ${task.deadlineSlot}`, taskId: task.id, workerId: worker.id })
+    }
+    if (item.endSlot > workload.horizonSlots) {
+      details.push({ type: 'deadline', message: `Task ${task.id} extends beyond operating horizon (${workload.horizonSlots} slots)`, taskId: task.id, workerId: worker.id })
+    }
+    if (!worker.skills.includes(task.skill)) {
+      details.push({ type: 'skill', message: `Worker ${worker.name} lacks required skill "${task.skill}" (worker has: ${worker.skills.join(', ')})`, taskId: task.id, workerId: worker.id })
+    }
+    for (const window of worker.unavailable) {
+      if (item.startSlot < window.end && item.endSlot > window.start) {
+        details.push({ type: 'unavailable', message: `Worker ${worker.name} is on scheduled break during slots [${window.start}, ${window.end})`, taskId: task.id, workerId: worker.id })
+      }
+    }
   }
+
   for (const worker of workload.workers) {
     const shifts = assignments.filter(item => item.workerId === worker.id).sort((a, b) => a.startSlot - b.startSlot)
-    if (shifts.length > worker.maxTasks || shifts.reduce((sum, item) => sum + item.endSlot - item.startSlot, 0) > worker.capacitySlots) violations++
-    for (let i = 1; i < shifts.length; i++) if (shifts[i].startSlot < shifts[i - 1].endSlot + workload.restSlots) violations++
+    if (shifts.length > worker.maxTasks) {
+      details.push({ type: 'max_tasks', message: `Worker ${worker.name} assigned ${shifts.length} tasks (exceeds limit of ${worker.maxTasks})`, workerId: worker.id })
+    }
+    const totalSlots = shifts.reduce((sum, item) => sum + item.endSlot - item.startSlot, 0)
+    if (totalSlots > worker.capacitySlots) {
+      details.push({ type: 'capacity', message: `Worker ${worker.name} assigned ${totalSlots} slots (exceeds shift capacity of ${worker.capacitySlots})`, workerId: worker.id })
+    }
+    for (let i = 1; i < shifts.length; i++) {
+      if (shifts[i].startSlot < shifts[i - 1].endSlot + workload.restSlots) {
+        details.push({ type: 'rest', message: `Worker ${worker.name} has insufficient rest between tasks ${shifts[i - 1].taskId} and ${shifts[i].taskId} (requires ${workload.restSlots} slot buffer)`, workerId: worker.id })
+      }
+    }
   }
-  return violations
+
+  return { violations: details.length, details }
 }
 
-export function toAllocationResult(workload: Workload, algorithm: string, assignments: Assignment[], latencyMs: number, status: AllocationResult['status'] = 'feasible', objectiveValue: number | null = null, optimalityGapPercent: number | null = null, wasmExecutionMs: number | null = null): AllocationResult {
+export function countViolations(workload: Workload, assignments: Assignment[]): number {
+  return auditViolations(workload, assignments).violations
+}
+
+export function toAllocationResult(
+  workload: Workload,
+  algorithm: string,
+  assignments: Assignment[],
+  latencyMs: number,
+  status: AllocationResult['status'] = 'feasible',
+  objectiveValue: number | null = null,
+  optimalityGapPercent: number | null = null,
+  wasmExecutionMs: number | null = null
+): AllocationResult {
   const allocationMatrix: Record<string, string | null> = Object.fromEntries(workload.tasks.map(task => [task.id, null]))
   for (const assignment of assignments) allocationMatrix[assignment.taskId] = assignment.workerId
   return {
-    algorithm, status, assignments, allocationMatrix,
+    algorithm,
+    status,
+    assignments,
+    allocationMatrix,
     unassignedTaskIds: workload.tasks.filter(task => allocationMatrix[task.id] === null).map(task => task.id),
-    latencyMs, wasmExecutionMs, violationCount: countViolations(workload, assignments), objectiveValue, optimalityGapPercent,
+    latencyMs,
+    totalTimeMs: latencyMs,
+    wasmExecutionMs,
+    wasmSolveTimeMs: wasmExecutionMs,
+    violationCount: countViolations(workload, assignments),
+    objectiveValue,
+    optimalityGapPercent,
   }
 }
 
@@ -158,7 +251,9 @@ export async function solveMilp(workload: Workload, fairnessWeight = 0.35, timeL
   const optimal = raw.result.status === glpk.GLP_OPT
   const feasible = optimal || raw.result.status === glpk.GLP_FEAS
   const assignments: Assignment[] = feasible ? candidates.filter(candidate => raw.result.vars[candidate.name] > 0.5).map(candidate => ({ taskId: candidate.task.id, workerId: candidate.worker.id, startSlot: candidate.start, endSlot: candidate.end })) : []
-  return toAllocationResult(workload, 'MILP', assignments, performance.now() - started, optimal ? 'optimal' : feasible ? 'feasible' : raw.result.status === glpk.GLP_NOFEAS ? 'infeasible' : 'time_limit', feasible ? raw.result.z : null, optimal ? 0 : null, raw.time * 1000)
+  const wasmSolveTimeMs = raw.time * 1000
+  const totalTimeMs = performance.now() - started
+  return toAllocationResult(workload, 'MILP', assignments, totalTimeMs, optimal ? 'optimal' : feasible ? 'feasible' : raw.result.status === glpk.GLP_NOFEAS ? 'infeasible' : 'time_limit', feasible ? raw.result.z : null, optimal ? 0 : null, wasmSolveTimeMs)
 }
 
 async function solveBatchedMilp(workload: Workload, fairnessWeight: number, timeLimitSeconds: number): Promise<AllocationResult> {
@@ -185,5 +280,6 @@ async function solveBatchedMilp(workload: Workload, fairnessWeight: number, time
     if (result.status !== 'optimal' && result.status !== 'feasible') break
     assignments.push(...result.assignments)
   }
-  return toAllocationResult(workload, 'MILP (batched)', assignments, performance.now() - started, 'decomposed', null, null, wasmExecutionMs)
+  const totalTimeMs = performance.now() - started
+  return toAllocationResult(workload, 'MILP (batched)', assignments, totalTimeMs, 'decomposed', null, null, wasmExecutionMs)
 }

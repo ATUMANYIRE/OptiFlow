@@ -9,7 +9,14 @@ import type { Workload } from '../src/lib/types.js'
 const root = resolve(fileURLToPath(new URL('../../dist/', import.meta.url)))
 const port = Number(process.env.PORT ?? 3001)
 const allowedOrigins = new Set(['http://localhost:3002', 'http://127.0.0.1:3002'])
-const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.wasm': 'application/wasm', '.svg': 'image/svg+xml', '.json': 'application/json' }
+const contentTypes: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json',
+}
 
 function json(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -55,7 +62,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
       const fairnessWeight = payload.fairnessWeight === undefined ? 0.35 : Number(payload.fairnessWeight)
       if (!Number.isFinite(fairnessWeight) || fairnessWeight < 0 || fairnessWeight > 1) throw new Error('fairnessWeight must be between 0 and 1')
       const workload = payload.workload
-        ? payload.workload as Workload
+        ? (payload.workload as Workload)
         : generateWorkload(Number(payload.taskCount ?? 50), Number(payload.seed ?? 2026))
       if (workload.tasks.length > 1000 || workload.workers.length > 200) throw new Error('Workload exceeds API limits')
       return json(response, 200, path === '/api/solve' ? await solveMilp(workload, fairnessWeight) : await compareAlgorithms(workload, fairnessWeight))
@@ -64,18 +71,47 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     }
   }
   if (method !== 'GET' && method !== 'HEAD') return json(response, 405, { error: 'Method not allowed' })
+
   try {
-    const requested = path === '/' ? '/index.html' : path
-    const file = resolve(root, `.${requested}`)
+    let requested = path === '/' ? '/index.html' : path
+    let file = resolve(root, `.${requested}`)
+
     if (file !== root && !file.startsWith(root + sep)) return json(response, 403, { error: 'Forbidden' })
-    const info = await stat(file)
-    if (!info.isFile()) return json(response, 404, { error: 'Not found' })
-    response.writeHead(200, { 'Content-Type': contentTypes[extname(file)] ?? 'application/octet-stream', 'Content-Length': info.size, 'Cache-Control': file.endsWith('index.html') ? 'no-cache' : 'public, max-age=3600' })
-    if (method === 'HEAD') { response.end(); return }
+
+    let isFile = false
+    try {
+      const info = await stat(file)
+      isFile = info.isFile()
+    } catch {
+      // SPA fallback for client routes without extensions
+      if (!extname(requested)) {
+        file = resolve(root, 'index.html')
+        const fallbackInfo = await stat(file)
+        isFile = fallbackInfo.isFile()
+        requested = '/index.html'
+      }
+    }
+
+    if (!isFile) return json(response, 404, { error: 'Not found' })
+
+    const finalStat = await stat(file)
+    response.writeHead(200, {
+      'Content-Type': contentTypes[extname(file)] ?? 'application/octet-stream',
+      'Content-Length': finalStat.size,
+      'Cache-Control': file.endsWith('index.html') ? 'no-cache' : 'public, max-age=3600',
+    })
+    if (method === 'HEAD') {
+      response.end()
+      return
+    }
     response.end(await readFile(file))
-  } catch { json(response, 404, { error: 'Not found' }) }
+  } catch {
+    json(response, 404, { error: 'Not found' })
+  }
 }
 
-createServer((request, response) => { void handle(request, response).catch(error => json(response, 500, { error: error instanceof Error ? error.message : 'Internal error' })) }).listen(port, '0.0.0.0', () => {
+createServer((request, response) => {
+  void handle(request, response).catch(error => json(response, 500, { error: error instanceof Error ? error.message : 'Internal error' }))
+}).listen(port, '0.0.0.0', () => {
   process.stdout.write(`OptiFlow listening on http://localhost:${port}\n`)
 })

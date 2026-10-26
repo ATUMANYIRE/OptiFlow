@@ -1,5 +1,9 @@
 import ReactDOM from 'react-dom/client'
-import Dashboard from './components/Dashboard'
+import App from './App'
+import { prewarmMilp } from './lib/solver/milpCore'
 import './styles.css'
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<Dashboard />)
+// Pre-warm WebAssembly MILP singleton on initialization
+void prewarmMilp()
+
+ReactDOM.createRoot(document.getElementById('root')!).render(<App />)

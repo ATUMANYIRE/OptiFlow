@@ -33,7 +33,9 @@ export interface AllocationResult {
   allocationMatrix: Record<string, string | null>
   unassignedTaskIds: string[]
   latencyMs: number
+  totalTimeMs?: number
   wasmExecutionMs: number | null
+  wasmSolveTimeMs?: number | null
   violationCount: number
   optimalityGapPercent: number | null
   objectiveValue: number | null
@@ -43,9 +45,17 @@ export interface BenchmarkMetrics {
   assigned: number
   unassigned: number
   averageTaskDelayMinutes: number | null
+  averageTaskDelaySeconds?: number | null
   skillMismatchRatePercent: number
   workerLoadVariance: number
   workerOverloadVariance: number
   computeLatencyMs: number
   violations: number
+  violationRatePercent?: number
+}
+export interface ConstraintViolationDetail {
+  type: 'skill' | 'capacity' | 'max_tasks' | 'rest' | 'unavailable' | 'deadline' | 'duplicate'
+  message: string
+  taskId?: string
+  workerId?: string
 }
