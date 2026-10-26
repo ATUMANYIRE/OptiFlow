@@ -1,0 +1,9 @@
+Welcome to OptiFlow, a scheduling engine for busy teams. The dashboard starts with fifty requests and shows allocation rate, constraint violations, optimality gap, and WebAssembly solve time.
+
+Open Scheduling. Green tasks are normal, orange tasks are urgent, and purple tasks need critical skills. Hover over a block to see its skill, time, and worker. Stripes show unavailable windows.
+
+Move the optimization slider toward fairness. The warmed solver runs again, updating the schedule and Pareto chart. Move it back toward minimum delay to compare the trade off.
+
+Open Benchmarks. OptiFlow compares Greedy, Round Robin, and Random allocation on the same workload. The chart shows placed and unplaced tasks; the figures show average delay.
+
+Run the two hundred task surge, then the five hundred task stress test. The board and metrics refresh. Export results to save assignments, measurements, and frontier data as JSON. OptiFlow makes scheduling trade offs visible.

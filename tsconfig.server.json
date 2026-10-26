@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.server.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "NodeNext",
+    "skipLibCheck": true,
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "rootDir": ".",
+    "outDir": "server-dist",
+    "strict": true,
+    "types": ["node"]
+  },
+  "include": ["server/**/*.ts", "src/lib/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}
