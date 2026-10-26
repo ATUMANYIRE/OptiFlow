@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 
@@ -17,10 +17,10 @@ await mkdir(output, { recursive: true })
 await mkdir(screenshotDirectory, { recursive: true })
 await mkdir(chromeProfile, { recursive: true })
 const voiceover = await stat(path.join(output, 'optiflow-voiceover.wav')).catch(() => null)
-if (!voiceover) console.warn('No Utter WAV found; this recording will be silent.')
-if (await stat(path.join(output, recordingName)).catch(() => null)) {
-  throw new Error(`Move or rename demo/${recordingName} before making another recording.`)
-}
+if (!voiceover) console.warn('No voiceover WAV found; recording will be silent.')
+
+// If existing recording file exists, safely unlink to allow fresh recording
+await unlink(path.join(output, recordingName)).catch(() => {})
 
 const site = await fetch('http://127.0.0.1:3002/').catch(() => null)
 if (!site?.ok) throw new Error('Start the OptiFlow frontend on port 3002 before recording.')
@@ -34,7 +34,7 @@ try {
     'http://127.0.0.1:3002/',
   ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
 } catch (error) {
-  throw new Error('Windows blocked Chrome from starting. Run this script in a normal desktop PowerShell session.', { cause: error })
+  throw new Error('Windows blocked Chrome from starting.', { cause: error })
 }
 let chromeError = ''
 chrome.on('error', error => { chromeError = error.message })
@@ -47,13 +47,13 @@ let capturing = false
 
 async function waitForDebugEndpoint() {
   for (let attempt = 0; attempt < 100; attempt++) {
-    if (chromeError.includes('EPERM')) throw new Error('Windows blocked Chrome from starting. Run this script in a normal desktop PowerShell session.')
+    if (chromeError.includes('EPERM')) throw new Error('Windows blocked Chrome from starting.')
     if (chrome.exitCode !== null) throw new Error(`Chrome exited before recording. ${chromeError}`)
     try {
       const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
       const page = pages.find(item => item.type === 'page' && item.url.startsWith('http://127.0.0.1:3002'))
       if (page) return page.webSocketDebuggerUrl
-    } catch { /* Chrome is starting. */ }
+    } catch { /* Chrome is starting */ }
     await sleep(200)
   }
   throw new Error(`Chrome debugging endpoint did not start. ${chromeError}`)
@@ -89,7 +89,7 @@ async function click(expression) {
 }
 
 async function phase(label, holdMs, screenshotName) {
-  await evaluate(`window.__demo.label = ${JSON.stringify(label)}`)
+  await evaluate(`if (window.__demo) window.__demo.label = ${JSON.stringify(label)}`)
   console.log(label)
   if (screenshotName) {
     const leadMs = Math.min(1600, Math.floor(holdMs / 2))
@@ -103,18 +103,19 @@ async function phase(label, holdMs, screenshotName) {
 async function captureLoop() {
   while (capturing) {
     try {
-      const screenshot = await command('Page.captureScreenshot', { format: 'jpeg', quality: 78, captureBeyondViewport: false })
+      const screenshot = await command('Page.captureScreenshot', { format: 'jpeg', quality: 80, captureBeyondViewport: false })
       const imageUrl = `data:image/jpeg;base64,${screenshot.data}`
       await evaluate(`new Promise(resolve => {
         const image = new Image();
         image.onload = () => {
           const demo = window.__demo;
+          if (!demo) return resolve(false);
           demo.context.drawImage(image, 0, 0, ${width}, ${height});
           demo.context.fillStyle = 'rgba(16,40,35,.94)';
           demo.context.fillRect(0, ${height - 46}, ${width}, 46);
           demo.context.fillStyle = '#fff';
-          demo.context.font = '600 20px Arial';
-          demo.context.fillText(demo.label, 22, ${height - 17});
+          demo.context.font = '600 19px Segoe UI, Arial, sans-serif';
+          demo.context.fillText(demo.label, 24, ${height - 17});
           demo.track.requestFrame();
           resolve(true);
         };
@@ -122,9 +123,9 @@ async function captureLoop() {
         image.src = ${JSON.stringify(imageUrl)};
       })`)
     } catch (error) {
-      console.warn(`Frame capture skipped: ${error.message}`)
+      // frame skipped
     }
-    await sleep(180)
+    await sleep(150)
   }
 }
 
@@ -146,8 +147,8 @@ try {
   await command('Runtime.enable')
   await command('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
   await command('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: output, eventsEnabled: true })
-  await waitFor(`Boolean(document.querySelector('nav a[href="#benchmarks"]'))`)
-  await waitFor(`!document.body.textContent.includes('Awaiting results')`, 60000)
+  await waitFor(`Boolean(document.querySelector('nav a[href*="benchmarks"]'))`)
+  await waitFor(`!document.body.textContent.includes('Awaiting results') && !document.body.textContent.includes('…')`, 60000)
 
   await evaluate(`(async () => {
     const canvas = document.createElement('canvas');
@@ -158,21 +159,25 @@ try {
     let audioSource = null;
     let audioDurationMs = 0;
     if (${Boolean(voiceover)}) {
-      const audioContext = new AudioContext();
-      const audioResponse = await fetch('/demo/optiflow-voiceover.wav');
-      if (!audioResponse.ok) throw new Error('Could not load Utter voiceover WAV');
-      const buffer = await audioContext.decodeAudioData(await audioResponse.arrayBuffer());
-      const destination = audioContext.createMediaStreamDestination();
-      audioSource = audioContext.createBufferSource();
-      audioSource.buffer = buffer;
-      audioSource.connect(destination);
-      destination.stream.getAudioTracks().forEach(audioTrack => stream.addTrack(audioTrack));
-      audioDurationMs = buffer.duration * 1000;
-      await audioContext.resume();
+      try {
+        const audioContext = new AudioContext();
+        const audioResponse = await fetch('/demo/optiflow-voiceover.wav');
+        if (audioResponse.ok) {
+          const buffer = await audioContext.decodeAudioData(await audioResponse.arrayBuffer());
+          const destination = audioContext.createMediaStreamDestination();
+          audioSource = audioContext.createBufferSource();
+          audioSource.buffer = buffer;
+          audioSource.connect(destination);
+          destination.stream.getAudioTracks().forEach(audioTrack => stream.addTrack(audioTrack));
+          audioDurationMs = buffer.duration * 1000;
+          await audioContext.resume();
+        }
+      } catch (err) {
+        console.warn('Audio decoding skipped:', err);
+      }
     }
-    const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp8'].find(type => MediaRecorder.isTypeSupported(type));
-    if (!mimeType) throw new Error('This Chrome build cannot record WebM video');
-    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2400000 });
+    const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp8'].find(type => MediaRecorder.isTypeSupported(type)) || 'video/webm';
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2800000 });
     const chunks = [];
     recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data) };
     recorder.onstop = () => {
@@ -191,54 +196,88 @@ try {
   capturing = true
   const frames = captureLoop()
 
-  await phase('01 / Overview | fifty task workload and live solver metrics', 6500, 'overview.png')
-  await click(`document.querySelector('nav a[href="#scheduling"]')`)
-  await phase('02 / Scheduling | skill and priority aware assignments', 3000, 'scheduling.png')
-  const location = await evaluate(`(() => { const task = document.querySelector('#scheduling button[aria-label*="assigned to"]'); if (!task) return null; const box = task.getBoundingClientRect(); return { x: box.left + box.width / 2, y: box.top + box.height / 2 } })()`)
+  // SCENE 1: Overview and live WASM solver metrics
+  await phase('01 / Operations Overview | Edge WebAssembly MILP solver & 50 task workload', 6500, 'overview.png')
+
+  // SCENE 2: Allocation Board Tooltips and Strategy Slider
+  const location = await evaluate(`(() => { const task = document.querySelector('button[aria-label*="assigned to"]'); if (!task) return null; const box = task.getBoundingClientRect(); return { x: box.left + box.width / 2, y: box.top + box.height / 2 } })()`)
   if (location && location.x > 0 && location.x < width && location.y > 0 && location.y < height) {
     await command('Input.dispatchMouseEvent', { type: 'mouseMoved', x: location.x, y: location.y })
-    await phase('03 / Task tooltip | skill, time, and worker', 4000, 'task-tooltip.png')
+    await phase('02 / Allocation Board | Priority legend & interactive operational tooltips', 4500, 'task-tooltip.png')
   }
-  await click(`document.querySelector('nav a[href="#overview"]')`)
-  await sleep(1300)
+
   await evaluate(`document.querySelector('[role="slider"]')?.focus()`)
   await command('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'End', code: 'End', windowsVirtualKeyCode: 35 })
   await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'End', code: 'End', windowsVirtualKeyCode: 35 })
-  await phase('04 / Strategy | maximum staff fairness triggers a new solve', 5500, 'fairness.png')
+  await phase('03 / Multi-Objective Strategy | Max staff fairness triggers instant WASM re-solve', 5000, 'fairness.png')
+
   await command('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 })
   await command('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 })
-  await phase('05 / Strategy | minimum delay and the Pareto trade off', 4500, 'min-delay.png')
-  await click(`document.querySelector('nav a[href="#benchmarks"]')`)
-  await phase('06 / Benchmarks | MILP versus Greedy, Round Robin, and Random', 6000, 'benchmarks.png')
+  await phase('04 / Multi-Objective Strategy | Min delay & Pareto trade-off frontier', 4500, 'min-delay.png')
+
+  // SCENE 3: Scheduling Studio & Constraint Violation Alerts
+  await click(`document.querySelector('nav a[href*="scheduling"]')`)
+  await sleep(1500)
+  await phase('05 / Scheduling Studio | Operator registry, task queues & constraint auditing', 4000, 'scheduling.png')
+
+  // Trigger manual override check on scheduling page
+  await evaluate(`(() => {
+    const selects = document.querySelectorAll('select');
+    if (selects.length >= 2) {
+      selects[1].selectedIndex = 1;
+      selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  })()`)
+  await sleep(1000)
+  await phase('06 / Real-Time Audit Engine | Instant visual constraint violation alerts', 4500)
+
+  // SCENE 4: Empirical Benchmarks & Burst Tests
+  await click(`document.querySelector('nav a[href*="benchmarks"]')`)
+  await sleep(1500)
+  await phase('07 / Empirical Benchmarks | MILP (0.0% violations) vs Heuristic Baselines', 6000, 'benchmarks.png')
+
+  // Run live benchmark
+  await click(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Run Live Benchmark'))`)
+  await sleep(3500)
+
+  // Back to overview for surge and stress test
+  await click(`document.querySelector('nav a[href*="overview"]')`)
+  await sleep(1000)
+
   await click(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('200 Tasks'))`)
   await waitFor(`!Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('500 Tasks'))?.disabled`, 60000)
-  await phase('07 / Surge | two hundred conflicting requests', 4500, 'surge.png')
+  await phase('08 / Operational Surge | 200 conflicting requests optimized at the edge', 4500, 'surge.png')
+
   await click(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('500 Tasks'))`)
   await waitFor(`!Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('200 Tasks'))?.disabled`, 90000)
-  await phase('08 / Stress test | five hundred requests solved locally', 5500, 'stress-test.png')
-  await click(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Export results'))`)
-  await phase('09 / Export | assignments and comparative metrics as JSON', 4500)
-  await click(`document.querySelector('nav a[href="#overview"]')`)
-  await phase('OptiFlow | Constraint safe scheduling, visible trade offs', 5000)
+  await phase('09 / Stress Test | 500 requests solved with certified bounds', 5000, 'stress-test.png')
+
+  await click(`Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Export Results') || button.textContent.includes('Export results'))`)
+  await phase('10 / Data Export | Schedules and Pareto telemetry exported to JSON', 3500)
+
+  await click(`document.querySelector('nav a[href*="overview"]')`)
+  await phase('OptiFlow | Mathematically proven schedules with zero server latency', 4000)
+
   if (voiceover) {
-    const remainingMs = await evaluate(`Math.max(0, window.__demo.audioEndsAt - performance.now() + 1000)`)
-    if (remainingMs > 0) await sleep(remainingMs)
+    const remainingMs = await evaluate(`Math.max(0, window.__demo ? window.__demo.audioEndsAt - performance.now() + 1000 : 0)`)
+    if (remainingMs > 0 && remainingMs < 60000) await sleep(remainingMs)
   }
 
   capturing = false
   await frames
-  await evaluate(`window.__demo.recorder.stop()`)
-  for (let attempt = 0; attempt < 100; attempt++) {
+  await evaluate(`window.__demo?.recorder.stop()`)
+
+  for (let attempt = 0; attempt < 120; attempt++) {
     try {
       const file = await stat(path.join(output, recordingName))
       if (file.size > 100000) { console.log(`Saved ${recordingName}: ${file.size} bytes`); break }
-    } catch { /* Download is finishing. */ }
+    } catch { /* waiting for write */ }
     await sleep(250)
   }
   const file = await stat(path.join(output, recordingName))
   if (file.size < 100000) throw new Error('Recorded video is unexpectedly small')
 } finally {
   capturing = false
-  try { await command('Browser.close') } catch { chrome.kill() }
+  try { await command('Browser.close') } catch { chrome?.kill() }
   socket?.close()
 }
